@@ -172,6 +172,18 @@ def process_packet(packet):
             direction = "INTERNAL" # For loopback/local
         # ---------------------------
 
+        # --- PROTECTED PORT PROBE (Port 4776) ---
+        PROTECTED_PORT = 4776
+        if dst_port == PROTECTED_PORT:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            probe_alert = (
+                f"[{timestamp}] ⚠️ RULE-BASED ALERT: Unauthorized Probe on Port {PROTECTED_PORT} | "
+                f"({direction}) | {src_ip}:{src_port} -> {dst_ip}:{dst_port}"
+            )
+            print(f"\r{probe_alert}")
+            logging.info(probe_alert)
+        # ----------------------------------------
+
         # Bidirectional Flow ID
         ip_pair = tuple(sorted((src_ip, dst_ip)))
         port_pair = tuple(sorted((src_port, dst_port)))
@@ -215,7 +227,7 @@ def process_packet(packet):
 
             if any(x in potential_attack for x in ["DDoS", "DoS", "DOS"]):
                 mapped_verdict = "DOS"
-                current_threshold = 0.27  # Optimized sweet-spot for your model
+                current_threshold = 0.27
             elif "Web Attack" in potential_attack:
                 mapped_verdict = "WEB_ATTACK"
                 current_threshold = 0.25 
@@ -224,7 +236,6 @@ def process_packet(packet):
                 current_threshold = 0.20
 
             if direction == "INTERNAL":
-                # We raise the bar: AI must be 40% sure to alert on local traffic
                 current_threshold = 0.40 
 
             # Final Verdict Decision
@@ -238,12 +249,12 @@ def process_packet(packet):
             timestamp = datetime.now().strftime("%H:%M:%S")
             output = (
                 f"[{timestamp}] {prefix}: {verdict} | "
-                f"({direction}) | " # Added the direction label here
+                f"({direction}) | " 
                 f"Suspicion: {suspicion_score*100:.1f}% | "
                 f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
             )
             
-            print(f"\r{output}") # \r clears the "..." dots
+            print(f"\r{output}")
             if verdict != "BENIGN":
                 logging.info(output)
 
