@@ -9,28 +9,93 @@ import warnings
 import sys
 from collections import defaultdict
 import time
-from scapy.all import get_if_list
+from scapy.all import get_working_ifaces, conf, sniff, get_if_list
 import os
+import platform
+import subprocess
+import os
+from plyer import notification
+from datetime import datetime
+import socket
+import platform
+
+
+threat_tracker = {}
+CURRENT_OS = platform.system()
+
+
+def send_alert(ip, count):
+    title = "INTRUSION DETECTED"
+    message = f"High suspicion ({count} pkts) from {ip}"
+    
+    if CURRENT_OS == "Windows":
+        import winsound
+        winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+        notification.notify(title=title, message=message, app_name="HIDS", timeout=5)
+    elif CURRENT_OS == "Linux":
+        
+        print('\a')
+        
+        try:
+            subprocess.run([
+                "notify-send", 
+                title, 
+                message, 
+                "-t", "5000", 
+                "-u", "normal", 
+                "-a", "HIDS-AI"
+            ], check=False)
+        except Exception as e:
+            notification.notify(title=title, message=message, timeout=5)
 
 def choose_interface():
-    interfaces = get_if_list()
+    current_os = platform.system()
+    
+    if current_os == "Windows":
+        
+        all_interfaces = get_working_ifaces()
+        keywords = ["ethernet", "wi-fi", "wlan"]
+        filtered_ifaces = []
 
-    print("\n--- 🌐 Available Network Interfaces ---")
-    for i, iface in enumerate(interfaces):
-        print(f"{i}: {iface}")
+        for iface in all_interfaces:
+            desc = iface.description.lower()
+            if any(key in desc for key in keywords):
+                if "virtual" not in desc and "loopback" not in desc:
+                    filtered_ifaces.append(iface)
 
-    while True:
-        choice = input("\nSelect interface number (Enter for default): ")
-        if choice == "":
-            # This uses Scapy's internal 'conf' to find the best card automatically
-            return conf.iface 
-        try:
-            idx = int(choice)
-            if 0 <= idx < len(interfaces):
-                return interfaces[idx]
-        except:
-            pass
-        print("Invalid selection. Try again.")
+        print("\n--- Windows Physical Interfaces ---")
+        if not filtered_ifaces:
+            print("[!] No physical cards detected. Showing all.")
+            filtered_ifaces = all_interfaces
+        
+        for i, iface in enumerate(filtered_ifaces):
+            print(f"{i}: {iface.description}")
+
+        while True:
+            choice = input("\nSelect interface number (Enter for default): ")
+            if choice == "": return conf.iface 
+            try:
+                idx = int(choice)
+                if 0 <= idx < len(filtered_ifaces):
+                    return filtered_ifaces[idx].name
+            except: pass
+            print("Invalid selection.")
+
+    else:
+        interfaces = get_if_list()
+        print("\n--- 🐧 Linux Network Interfaces ---")
+        for i, iface in enumerate(interfaces):
+            print(f"{i}: {iface}")
+
+        while True:
+            choice = input("\nSelect interface number (Enter for default): ")
+            if choice == "": return conf.iface 
+            try:
+                idx = int(choice)
+                if 0 <= idx < len(interfaces):
+                    return interfaces[idx]
+            except: pass
+            print("Invalid selection.")
 
 flow_table = {}
 
@@ -55,10 +120,8 @@ class Flow:
         self.init_win_fwd = 0
         self.init_win_bwd = 0
 
-# 1. Setup and Suppress Warnings
 warnings.filterwarnings("ignore")
 
-# 2. Setup Auto-Rotating Logging (Keeps last 90 days)
 log_filename = "ids_report.log"
 handler = TimedRotatingFileHandler(
     log_filename, when="D", interval=1, backupCount=90
@@ -69,19 +132,16 @@ logging.basicConfig(
     format='%(message)s'
 )
 
-# 3. Load the AI Models
 try:
-    print("--- 🧠 Initializing IDS AI Engine ---")
+    print("--- Initializing IDS AI Engine ---")
     rf_model = joblib.load('random_forest_model.joblib')
     scaler = joblib.load('standard_scaler.joblib')
     le = joblib.load('label_encoder.joblib')
-    print("✅ System Ready. Monitoring Live Traffic...")
+    print("System Ready. Monitoring Live Traffic...")
 except Exception as e:
-    print(f"❌ Initialization Error: {e}")
+    print(f"Initialization Error: {e}")
     sys.exit()
 
-# 4. Feature Extraction (Packet to AI Vector)
-# ... (Keep your imports and Flow class the same) ...
 
 FEATURES = [
     'Total Length of Bwd Packets', 'Fwd Packet Length Min', 'Bwd Packet Length Min', 
@@ -94,7 +154,6 @@ FEATURES = [
 ]
 
 def extract_features(flow):
-    # Ensure variables are arrays for math
     fwd = np.array(flow.fwd_lengths) if flow.fwd_lengths else np.array([0])
     bwd = np.array(flow.bwd_lengths) if flow.bwd_lengths else np.array([0])
     flow_iat = np.array(flow.flow_iat) if flow.flow_iat else np.array([0])
@@ -103,7 +162,21 @@ def extract_features(flow):
 
     duration = max(time.time() - flow.start_time, 1e-6)
     all_packets = np.concatenate([fwd, bwd])
+    ACTIVE_THRESHOLD = 1
+    active_times = {}
+    idle_times = []
+    current_active = 0
 
+    for iat in flow_iat:
+        if iat < ACTIVE_THRESHOLD:
+            current_active += iat
+        else:
+            if current_active > 0:
+                active_times.append(current_active)
+            idle_times.append(iat)
+            current_active = 0
+    active_mean = np.mean(active_times) if active_times else 0
+    idle_min = np.min(idle_times) if idle_times else 0
     # The 25 Features in the EXACT order your scaler wants
     feat_values = [
         np.sum(bwd),                         # Total Length of Bwd Packets
@@ -129,15 +202,14 @@ def extract_features(flow):
         np.sum(fwd),                         # Subflow Fwd Bytes
         flow.init_win_fwd,                   # Init_Win_bytes_forward
         flow.init_win_bwd,                   # Init_Win_bytes_backward
-        np.mean(flow_iat),                   # Active Mean
-        np.min(flow_iat)                     # Idle Min
+        active_mean,                   # Active Mean
+        idle_min                     # Idle Min
     ]
 
     # Return as DataFrame with the 25 feature names defined earlier
     return pd.DataFrame([feat_values], columns=FEATURES)
 
-# --- ADD THIS OUTSIDE THE FUNCTION ONCE ---
-import socket
+
 def get_my_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -148,10 +220,8 @@ def get_my_ip():
     except: return "127.0.0.1"
 
 MY_IP = get_my_ip()
-# ------------------------------------------
 
 def process_packet(packet):
-    print(".", end="", flush=True)
     try:
         if not packet.haslayer(IP): return
 
@@ -162,6 +232,7 @@ def process_packet(packet):
         
         src_port = packet[protocol].sport
         dst_port = packet[protocol].dport
+        print(f"[{protocol}] {src_ip} -> {dst_ip}")
 
         # --- DIRECTION DETECTION ---
         if dst_ip == MY_IP:
@@ -170,19 +241,17 @@ def process_packet(packet):
             direction = "OUTGOING"
         else:
             direction = "INTERNAL" # For loopback/local
-        # ---------------------------
 
         # --- PROTECTED PORT PROBE (Port 4776) ---
         PROTECTED_PORT = 4776
         if dst_port == PROTECTED_PORT:
             timestamp = datetime.now().strftime("%H:%M:%S")
             probe_alert = (
-                f"[{timestamp}] ⚠️ RULE-BASED ALERT: Unauthorized Probe on Port {PROTECTED_PORT} | "
+                f"[{timestamp}] RULE-BASED ALERT: Unauthorized Probe on Port {PROTECTED_PORT} | "
                 f"({direction}) | {src_ip}:{src_port} -> {dst_ip}:{dst_port}"
             )
             print(f"\r{probe_alert}")
             logging.info(probe_alert)
-        # ----------------------------------------
 
         # Bidirectional Flow ID
         ip_pair = tuple(sorted((src_ip, dst_ip)))
@@ -238,22 +307,36 @@ def process_packet(packet):
             if direction == "INTERNAL":
                 current_threshold = 0.40 
 
-            # Final Verdict Decision
+            # 1. Final Verdict Decision
             if suspicion_score > current_threshold:
-                prefix = "🚨 ALERT"
+                prefix = "ALERT"
                 verdict = mapped_verdict
+                is_malicious = True
+                # Increment count
+                threat_tracker[src_ip] = threat_tracker.get(src_ip, 0) + 1
             else:
-                prefix = "🟢 NORMAL"
+                prefix = "NORMAL"
                 verdict = "BENIGN"
+                is_malicious = False
+                # Reset count so a single bad packet later doesn't trigger alert
+                threat_tracker[src_ip] = 0
 
+            # 2. Format the single output line
             timestamp = datetime.now().strftime("%H:%M:%S")
-            output = (
-                f"[{timestamp}] {prefix}: {verdict} | "
-                f"({direction}) | " 
-                f"Suspicion: {suspicion_score*100:.1f}% | "
-                f"{src_ip}:{src_port} -> {dst_ip}:{dst_port}"
-            )
+            output = (f"[{timestamp}] {prefix}: {verdict} | ({direction}) | "
+                      f"Suspicion: {suspicion_score*100:.1f}% | "
+                      f"{src_ip} -> {dst_ip}")
             
+            # 3. Print ONLY ONCE
+            print(output)
+
+            # 4. Trigger Notification Logic
+            if is_malicious:
+                # Optional: print the debug count on the same line or next
+                print(f"   └─ [DEBUG] Sequential Count: {threat_tracker[src_ip]}")
+                
+                if threat_tracker[src_ip] == 5:
+                    send_alert(src_ip, threat_tracker[src_ip])
             print(f"\r{output}")
             if verdict != "BENIGN":
                 logging.info(output)
@@ -271,24 +354,25 @@ if __name__ == "__main__":
         is_admin = os.getuid() == 0
 
     if not is_admin:
-        print("❌ ERROR: You must run this as Administrator (Windows) or Sudo (Linux/Mac).")
+        print(" ERROR: You must run this as Administrator (Windows) or Sudo (Linux/Mac).")
         sys.exit(1)
 
     warnings.filterwarnings("ignore")
 
     # Load Models
     try:
-        print("--- 🧠 Initializing IDS AI Engine ---")
+        print("--- Initializing IDS AI Engine ---")
         rf_model = joblib.load('random_forest_model.joblib')
         scaler = joblib.load('standard_scaler.joblib')
         le = joblib.load('label_encoder.joblib')
     except Exception as e:
-        print(f"❌ Load Error: {e}")
+        print(f" Load Error: {e}")
         sys.exit(1)
 
-    # Use Scapy's cross-platform interface selector
-    target_interface = choose_interface() 
-    print(f"\n[SYSTEM] Monitoring: {target_interface} | Local IP: {MY_IP}")
+
+    target_interface = choose_interface()
+    print(f"[SYSTEM] Running on {platform.system()} | Monitoring: {target_interface}")
+
 
     try:
         sniff(
